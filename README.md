@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | **Network** | GenLayer Studio Network (studionet) |
-| **Contract Address** | [`0x884aCED9C7551F1B5ba26d360D5D85bB3faF5E0b`](https://explorer-studio.genlayer.com/address/0x884aCED9C7551F1B5ba26d360D5D85bB3faF5E0b) |
+| **Contract Address** | [`0x3CbfafDA2ae2E9D8F46cB34Fb38B3bda58870D23`](https://explorer-studio.genlayer.com/address/0x3CbfafDA2ae2E9D8F46cB34Fb38B3bda58870D23) |
 | **Host Account** | `0xB02eA5D0d13B88D4cf5BE6Fbe88DB5835C4c1ad3` |
 | **Guest Account** | `0x0481cE639B6059a8200f2484746aDC926A0B3E7C` |
 | **Live Test** | **38/38 passed** — every write & view method, including one real AI-consensus turn resolution (verdicts `success`/`success`, XP 15/15) |
@@ -36,6 +36,7 @@ The contract deliberately **limits the LLM to closed sets** so no consensus brea
 | `verdict` | `critical_success`, `success`, `partial`, `failure` |
 | `damage` | `0, 5, 10, 20, 40` |
 | `heal` | `0, 5, 10, 20` |
+| `reward` | fixed tokens (`sunken_lantern`, `salt_etched_key`, `courier_sigil`, …) or `""` |
 
 Everything else is **derived deterministically by the contract**, never by the LLM:
 
@@ -47,17 +48,19 @@ Everything else is **derived deterministically by the contract**, never by the L
 
 ### What validators compare
 
-Validators compare the **material consequence** of each action, not the prose:
+Validators compare **every field that changes persistent state, exactly** — not the prose:
 
 - `idx` must be identical (same set of action indices, each exactly once).
-- `verdict` is compared by **success/failure class**: `critical_success`/`success` = success, `partial`/`failure` = failure. Two Game Masters often disagree on whether an action was a clean success or a partial one; that difference in generosity must not break consensus, but the success/failure boundary must.
+- `verdict` is compared **exactly** (`critical_success` ≠ `success`). It feeds XP directly, so a validator that tolerated a different verdict would be attesting to a different XP transition.
 - `damage` and `heal` are compared exactly (from the small closed sets).
-- `reward` is compared by **presence** (granted or not), never by its text: item names can never be identical across two LLM calls, but *whether a reward exists* is exactly the part that reaches the character's inventory — so presence is consensus-bound while the label is not.
+- `reward` is compared **exactly**, token for token. It is written verbatim into the character's inventory, so a validator that tolerated a different reward would be attesting to an inventory change it never agreed with. Common spelling/alias variants (`"Sunken Lantern"`, `"sunken-lantern"`) collapse onto the single canonical token before comparison, so they are the same value — and anything that cannot be resolved to a known token is rejected outright, never persisted.
 - `confidence` within a 25-point tolerance.
+
+This exact binding is only tractable because **every compared value comes from a small closed set**: four verdict strings and a fixed list of reward tokens. Two independent Game Master runs can genuinely converge on `"success"` + `"sunken_lantern"`; they could never converge on an original prose item name, which is why prose stays out of the comparison entirely.
 
 Narration (`scene`, `world_state`) with different wording is **not** a consensus mismatch — and is **never** fed back into the prompt (see below).
 
-> **Best-effort by nature.** A Game Master is subjective; validators run different models. AI consensus **succeeds when models agree on the material consequence** of an action and **fails** on borderline calls (e.g. one model grades "success" while another grades "partial"). A failed consensus never wedges the campaign: `resolve_turn_timeout` always advances the turn deterministically after the grace period, so liveness is fully guaranteed by the escape hatch.
+> **Best-effort by nature.** A Game Master is subjective; validators run different models. AI consensus **succeeds when models agree exactly on the mechanics** and **fails** when they disagree on any state-changing value (e.g. one model grades "success" while another grades "partial", or they pick different reward tokens). A failed consensus never wedges the campaign: `resolve_turn_timeout` always advances the turn deterministically after the grace period, voiding the pending actions, so liveness is fully guaranteed by the escape hatch.
 
 ### Why narration is never fed back into the prompt
 
@@ -225,15 +228,15 @@ class TurnNarrative:
 ## Security & Anti-Rejection
 
 1. **No escrow (non-payable)** — no fund/liveness gap involving money.
-2. **Closed value sets** — the LLM only picks verdict/damage/heal from fixed enums; everything else is computed by the contract.
-3. **Material-consequence comparison** — validators compare `idx` (identical), `verdict` by success/failure class, `damage`/`heal` exactly, and `reward` by presence. Narration is never compared (two LLMs can never agree on it) and is never fed back into the prompt, so there is no unverified influence channel.
-4. **`reward` is consensus-bound** — the *presence* of a reward (granted or not) must match between leader and validator, because that is what determines whether a character's inventory grows. The item label itself stays leader-committed (length-bounded).
+2. **Closed value sets** — the LLM only picks `verdict`/`damage`/`heal`/`reward` from fixed enums; everything else is computed by the contract.
+3. **Exact state-changing comparison** — validators compare `idx`, `verdict`, `damage`, `heal` and `reward` **all exactly**, because every one of them feeds persistent state (XP, HP, inventory). Only narration is excluded, and it is never fed back into the prompt, so there is no unverified influence channel.
+4. **`reward` is a closed set and consensus-bound exactly** — the LLM must choose a reward from a fixed token list (or `""`); the token is written verbatim into the character's inventory. Exact matching is tractable because the set is small; alias spellings collapse to the canonical token and unlisted items fail normalization, so a leader can never persist an item validators did not agree to.
 5. **Deterministic escape hatch** — `resolve_turn_timeout` defeats the liveness gap; campaigns cannot wedge.
 6. **Empty turns still advance** — a turn with no actions advances deterministically with no LLM, so no permanent deadlock.
 7. **Dual action window** — closed by the host *or* automatically via `turn_deadline`; the host cannot close before `MIN_CLOSE_DELAY_SEC`.
 8. **Caller restrictions** — start/end/close/rules are host-only; actions are member-only; respawn is only for your own dead character.
 9. **Bounded inputs** — all text is length-capped; `max_players` and time windows are validated before storage.
-10. **Bounded prompt data** — `scene` (800), `world_state` (500), `reward` (120), inventory (10 items).
+10. **Bounded prompt data** — `scene` (800), `world_state` (500), `reward` (closed token set), inventory (10 items).
 11. **Prompt-injection fence** — all host/player text is sent inside `<untrusted-data>` with an instruction that it is data, not instructions.
 12. **Guarded status transitions** — actions cannot enter after the window closes; rules freeze after start; campaigns end cleanly.
 13. **Bounded per-turn work** — the campaign keeps its own pending-action index list, so submit/resolve cost O(players), not O(all actions ever).
@@ -296,7 +299,7 @@ $env:PRIVATE_KEY_1="0x...01"; $env:PRIVATE_KEY_2="0x...02"; $env:TESTNET_PRIVATE
 python -m pytest tests/direct/ -q
 ```
 
-Covers the campaign lifecycle, input validation, action-window gates, consensus resolution (mocked LLM), validator mismatch cases (including `reward`), consensus tolerance (different reward wording but same presence, same-class verdicts), the timeout escape hatch, empty turns, prompt-injection fencing, and every view. **101 tests, all passing.**
+Covers the campaign lifecycle, input validation, action-window gates, consensus resolution (mocked LLM), exact validator binding (a different `verdict` or a different `reward` token is rejected, alias spellings collapse to the canonical token, unlisted rewards fail normalization), the timeout escape hatch, empty turns, prompt-injection fencing, and every view. **101 tests, all passing.**
 
 ### Integration tests (against a deployment)
 
