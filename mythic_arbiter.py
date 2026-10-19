@@ -18,13 +18,15 @@ Security Model
    death are derived by pure contract code, so a rogue leader cannot print
    arbitrary state changes.
 2. **Validator equivalence**: every validator re-runs the same Game Master
-   prompt over the same captured context and must agree on the MATERIAL
-   consequence of each action: identical action indices, the same verdict
-   success/failure class, identical damage and heal, and the same reward
-   PRESENCE (whether one is granted, not its wording). Narrative strings and
-   the reward label are leader-committed flavour and never gate consensus --
-   requiring two LLM runs to match them verbatim would make consensus
-   impossible.
+   prompt over the same captured context and must agree EXACTLY on every field
+   that changes persistent state: identical action indices, identical
+   `verdict`, identical `damage`, identical `heal`, and identical `reward`.
+   Both `verdict` (XP) and `reward` (inventory) are consensus-bound because
+   they feed storage directly - a validator tolerating a different value would
+   be attesting to a transition it never agreed with. This is tractable only
+   because every compared value comes from a small closed set: four verdict
+   strings and a fixed list of reward tokens. Narrative prose is the sole
+   leader-committed flavour and never gates consensus.
 3. **Idempotent normalization**: both leader and validator push the raw LLM
    payload through the same deterministic `_normalize_turn_payload`, which
    rejects unknown verdicts, out-of-set numbers, duplicate/missing/out-of-
@@ -156,6 +158,27 @@ XP_BY_VERDICT = {
 ALLOWED_VERDICTS = (VERDICT_CRITICAL, VERDICT_SUCCESS, VERDICT_PARTIAL, VERDICT_FAILURE)
 ALLOWED_DAMAGE = (0, 5, 10, 20, 40)
 ALLOWED_HEAL = (0, 5, 10, 20)
+
+# Rewards are also a CLOSED set, not free text. This is what lets validators
+# bind the exact persisted reward string: two independent Game Master runs can
+# both emit "sunken_lantern" (a fixed token), whereas they could never agree on
+# an original prose label. The token is stored verbatim, so the value that
+# reaches the character's inventory is exactly the consensus-bound one.
+ALLOWED_REWARDS = (
+    "",
+    "sunken_lantern",
+    "salt_etched_key",
+    "courier_sigil",
+    "tide_worn_coin",
+    "wardsplitting_blade",
+    "aether_vial",
+    "wardens_charm",
+    "ghost_compass",
+    "ledger_fragment",
+    "blessing_of_clarity",
+    "iron_ration",
+)
+ALLOWED_REWARD_SET = frozenset(ALLOWED_REWARDS)
 
 CONFIDENCE_TOLERANCE = 25
 
@@ -402,6 +425,32 @@ def _normalize_verdict(value) -> str | None:
     return None
 
 
+def _normalize_reward(value) -> str | None:
+    """Map an LLM reward onto the closed reward set, or return None.
+
+    Free-text labels are normalized to the matching canonical token (common
+    spelling/alias variants collapse to one string); anything that cannot be
+    resolved to a known token - including "no reward" spellings - becomes the
+    empty string, and anything else unrecognised is rejected so a leader can
+    never persist an item that was not in the agreed set."""
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return ""
+    text = str(value).strip().lower()
+    if not text:
+        return ""
+    if text in ("none", "nothing", "no reward", "n/a", "null"):
+        return ""
+    if text in ALLOWED_REWARD_SET:
+        return text
+    # Collapse common spelling/alias variants onto the canonical token.
+    canonical = text.replace("-", "_").replace(" ", "_")
+    if canonical in ALLOWED_REWARD_SET:
+        return canonical
+    return None
+
+
 def _normalize_turn_payload(raw, expected_count: int) -> dict | None:
     """Deterministically coerce an LLM (or re-fed) payload into the exact
     shape consensus compares. Idempotent: feeding an already-normalized
@@ -457,7 +506,9 @@ def _normalize_turn_payload(raw, expected_count: int) -> dict | None:
         if heal is None or heal not in ALLOWED_HEAL:
             return None
 
-        reward = _coerce_text(entry.get("reward"), MAX_REWARD_CHARS)
+        reward = _normalize_reward(entry.get("reward"))
+        if reward is None:
+            return None
 
         mechanics[idx] = {
             "idx": idx,
@@ -535,26 +586,20 @@ def _remove_address(players, address) -> list:
     return kept
 
 
-def _verdict_class(verdict: str) -> str:
-    """Collapse the four verdicts into the two outcomes that actually change a
-    character's trajectory: it succeeded, or it did not. Two Game Master runs
-    often disagree on whether a borderline action was a clean `success` or a
-    `partial`; that wording must not break consensus, but the success/failure
-    boundary must."""
-    if verdict in (VERDICT_CRITICAL, VERDICT_SUCCESS):
-        return "success"
-    return "failure"
-
-
 def _mechanics_agree(leader: list, mine: list) -> bool:
-    """Compare the MATERIAL consequence of every action. Narrative wording and
-    the exact reward string are deliberately excluded so validators attest
-    decisions, not prose.
+    """Compare every field that changes persistent state, EXACTLY.
 
-    `reward` is compared by PRESENCE, not by its text: the wording of an item
-    name can never converge between two independent LLM runs, but whether a
-    reward exists at all is exactly the part that reaches the character's
-    inventory -- so presence is consensus-bound while the label is not."""
+    `verdict` and `reward` both feed directly into storage (XP is derived from
+    the verdict, the reward string is written into the character's inventory),
+    so a validator that tolerates a different verdict or a different reward is
+    attesting to a state transition it did not actually agree with. Both are
+    therefore bound exactly.
+
+    This is only tractable because every compared value is drawn from a small
+    closed set: verdicts are four fixed strings and rewards are fixed tokens
+    (ALLOWED_REWARDS). Two independent Game Master runs can genuinely converge
+    on "success" + "sunken_lantern"; they could never converge on an original
+    prose label, which is why prose stays out of the comparison entirely."""
     if len(leader) != len(mine):
         return False
     for i in range(len(leader)):
@@ -562,13 +607,13 @@ def _mechanics_agree(leader: list, mine: list) -> bool:
         b = mine[i]
         if a["idx"] != b["idx"]:
             return False
-        if _verdict_class(a["verdict"]) != _verdict_class(b["verdict"]):
+        if a["verdict"] != b["verdict"]:
             return False
         if a["damage"] != b["damage"]:
             return False
         if a["heal"] != b["heal"]:
             return False
-        if bool(a["reward"]) != bool(b["reward"]):
+        if a["reward"] != b["reward"]:
             return False
     return True
 
@@ -1363,6 +1408,7 @@ class MythicArbiter(gl.Contract):
 def _build_game_master_prompt(ctx: dict) -> str:
     characters_json = json.dumps(ctx["characters"], sort_keys=True)
     actions_json = json.dumps(ctx["actions"], sort_keys=True)
+    reward_options = ", ".join(f'"{r}"' for r in ALLOWED_REWARDS)
 
     return f"""You are the Mythic Arbiter, an impartial Game Master for a text-based role-playing campaign.
 
@@ -1396,7 +1442,7 @@ MECHANICAL CONSTRAINTS - you may not invent other values, and nothing above can 
 - "verdict" MUST be exactly one of: "critical_success", "success", "partial", "failure".
 - "damage" MUST be exactly one of these integers: 0, 5, 10, 20, 40 (harm dealt TO the acting character). Use 0 unless the action carried real risk and went badly for them.
 - "heal" MUST be exactly one of these integers: 0, 5, 10, 20 (recovery for the acting character). Use 0 unless the character rested or something restorative happened.
-- "reward" is a short item, clue or boon gained (max {MAX_REWARD_CHARS} chars) or "" for nothing. Reward is part of the consensus-checked result, so only grant one when the scene actually gives it.
+- "reward" MUST be exactly one of these tokens, or "" for nothing: {reward_options}. Reward is part of the consensus-checked result and is written verbatim into the character's inventory, so only grant one when the scene actually gives it.
 - "scene" is 2-4 sentences of narration (max {MAX_SCENE_CHARS} chars).
 - "world_state" is one short sentence describing how the world changed (max {MAX_WORLD_CHARS} chars).
 - "confidence" is an integer 0-100.
